@@ -1,2 +1,6 @@
 java/
 koffee/
+__pycache__/
+portable_kore.py
+test_schema.json
+test.py

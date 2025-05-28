@@ -77,13 +77,12 @@ def resolve_type(value: str, current_file_no_ext: str, type_map: Dict[str, str])
 
     ref_file_no_ext = type_map.get(value)
     if not ref_file_no_ext:
-        return {"$ref": f"#/definitions/{value}"}
+        return {"$ref": f"#/definitions/{value}"}  # fallback if unknown
 
     if ref_file_no_ext == current_file_no_ext:
         return {"$ref": f"#/definitions/{value}"}
 
-    ref_path = os.path.relpath(ref_file_no_ext + '.json', os.path.dirname(current_file_no_ext)).replace(os.sep, '/')
-    return {"$ref": f"{ref_path}#/definitions/{value}"}
+    return {"$ref": f"output/{ref_file_no_ext}.json#/definitions/{value}"}
 
 def parse_struct(content: str, current_file_no_ext: str, type_map: Dict[str, str]) -> Dict[str, Any]:
     content = strip_attributes(content.strip('{}').strip())
@@ -123,10 +122,12 @@ def parse_use_statements(content: str, current_file_no_ext: str) -> Dict[str, st
     use_pattern = re.compile(r'use\s+(?P<path>(::|super::|[\w:]+)+)(?:\s+as\s+(?P<alias>\w+))?')
     uses = {}
     current_parts = current_file_no_ext.split(os.sep)
+
     for match in use_pattern.finditer(content):
         path = match.group('path')
         alias = match.group('alias')
         parts = []
+
         if path.startswith('::'):
             parts = path[2:].split('::')
         else:
@@ -138,16 +139,36 @@ def parse_use_statements(content: str, current_file_no_ext: str) -> Dict[str, st
                 else:
                     scope.append(part)
             parts = scope
+
         typename = parts[-1]
-        resolved_path = os.path.join('koffee', *parts[:-1]).replace(os.sep, '/')
+        resolved_path = '/'.join(parts[:-1]) if len(parts) > 1 else ''
         uses[alias or typename] = resolved_path
+
     return uses
+
+def split_union_types(s: str) -> List[str]:
+    parts = []
+    current = ''
+    depth = 0
+    for c in s:
+        if c == '|' and depth == 0:
+            parts.append(current.strip())
+            current = ''
+        else:
+            current += c
+            if c in '([{':
+                depth += 1
+            elif c in ')]}':
+                depth = max(0, depth - 1)
+    if current.strip():
+        parts.append(current.strip())
+    return parts
 
 # --- Compiler ---
 class McdocCompiler:
     def __init__(self, base_path: str, output_root: str):
         self.base_path = os.path.abspath(base_path)
-        self.output_root = os.path.abspath(output_root)
+        self.output_root = os.path.abspath(os.path.join('output', output_root))
         self.type_map: Dict[str, str] = {}
 
     def compile(self) -> None:
@@ -170,25 +191,31 @@ class McdocCompiler:
             content = strip_attributes(strip_comments(f.read()))
             structs = re.findall(r'struct\s+(\w+)\s*\{', content)
             enums = re.findall(r'enum\s*\(\w+\)\s+(\w+)\s*\{', content)
+            
+            rel_path_no_ext = os.path.relpath(full_path, self.base_path)
+            rel_path_no_ext = os.path.splitext(rel_path_no_ext)[0].replace(os.sep, '/')
+
             for t in structs + enums:
-                self.type_map[t] = out_path_no_ext
+                self.type_map[t] = rel_path_no_ext
 
     def _process_file(self, path: str) -> None:
         with open(path, 'r', encoding='utf-8') as f:
             raw = f.read()
 
         content = strip_attributes(strip_comments(raw))
-        rel_path_no_ext = os.path.splitext(os.path.relpath(path, self.base_path))[0]
+        rel_path_no_ext = os.path.splitext(os.path.relpath(path, self.base_path))[0].replace(os.sep, '/')
         uses = parse_use_statements(content, rel_path_no_ext)
         self.type_map.update(uses)
 
         structs = re.finditer(r'struct\s+(\w+)\s*\{(.*?)\}', content, re.DOTALL)
         enums = re.finditer(r'enum\s*\(\w+\)\s+(\w+)\s*\{(.*?)\}', content, re.DOTALL)
+        types = re.finditer(r'type\s+(\w+)\s*=\s*(\((?:[^()]*|\([^()]*\))*\)|[^\n]*)', content, re.DOTALL)
 
         out_file = os.path.join(self.output_root, rel_path_no_ext + '.json')
         os.makedirs(os.path.dirname(out_file), exist_ok=True)
 
         schema_defs = {}
+
         for match in structs:
             name, body = match.groups()
             schema_defs[name] = parse_struct(body, rel_path_no_ext, self.type_map)
@@ -196,6 +223,29 @@ class McdocCompiler:
         for match in enums:
             name, body = match.groups()
             schema_defs[name] = parse_enum(body)
+
+        for match in types:
+            name, body = match.groups()
+            body = body.strip()
+
+            if body.startswith('(') and body.endswith(')'):
+                parts = split_union_types(body[1:-1])
+                refs = []
+                for part in parts:
+                    # If it's a full struct definition, try to extract the name
+                    if part.startswith('struct'):
+                        struct_match = re.match(r'struct\s+\w+\s*\{(.*)\}', part, re.DOTALL)
+                        if struct_match:
+                            refs.append(parse_struct('{' + struct_match.group(1) + '}', rel_path_no_ext, self.type_map))
+                        else:
+                            print(f"⚠️ Could not parse inline struct: {part}")
+                    else:
+                        refs.append(resolve_type(part, rel_path_no_ext, self.type_map))
+
+
+                schema_defs[name] = { "anyOf": refs }
+            else:
+                schema_defs[name] = resolve_type(body, rel_path_no_ext, self.type_map)
 
         if schema_defs:
             with open(out_file, 'w', encoding='utf-8') as f:
@@ -211,8 +261,7 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description='Compile full mcdoc schema to JSON Schema.')
     parser.add_argument('mcdoc_path', help='Path to the root directory containing .mcdoc files (e.g., java/)')
-    parser.add_argument('--output_root', help='Root output directory (e.g., koffee/)', default='koffee')
     args = parser.parse_args()
 
-    compiler = McdocCompiler(args.mcdoc_path, args.output_root)
+    compiler = McdocCompiler(args.mcdoc_path, 'java')
     compiler.compile()
