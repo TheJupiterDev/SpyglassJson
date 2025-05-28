@@ -37,19 +37,23 @@ def parse_range(range_str: str) -> Dict[str, int]:
             result['maxItems'] = int(match.group(2))
     return result
 
-def resolve_type(value: str, current_file: str, type_map: Dict[str, str]) -> Dict[str, Any]:
+def resolve_type(value: str, current_file_no_ext: str, type_map: Dict[str, str]) -> Any:
     value = value.strip()
+
+    if value == '()':
+        return False
+
     range_match = re.search(r'@\s*[\d.<]+', value)
     range_part = value[range_match.start():] if range_match else ''
     value = value[:range_match.start()].strip() if range_match else value
 
     if value.startswith('(') and value.endswith(')') and '|' in value:
-        types = [resolve_type(part, current_file, type_map) for part in value[1:-1].split('|')]
+        types = [resolve_type(part, current_file_no_ext, type_map) for part in value[1:-1].split('|')]
         return {"anyOf": types}
 
     if re.match(r'^\[.*\]$', value):
         inner = value[1:-1].strip()
-        items = resolve_type(inner, current_file, type_map)
+        items = resolve_type(inner, current_file_no_ext, type_map)
         array_schema = {"type": "array", "items": items}
         array_schema.update(parse_range(range_part))
         return array_schema
@@ -71,11 +75,17 @@ def resolve_type(value: str, current_file: str, type_map: Dict[str, str]) -> Dic
     if value in type_map_builtins:
         return type_map_builtins[value]
 
-    ref_file = type_map.get(value, current_file)
-    rel_path = os.path.relpath(ref_file, os.path.dirname(current_file)).replace('\\', '/')
-    return {"$ref": f"{rel_path}.json#/definitions/{value}"}
+    ref_file_no_ext = type_map.get(value)
+    if not ref_file_no_ext:
+        return {"$ref": f"#/definitions/{value}"}
 
-def parse_struct(content: str, current_file: str, type_map: Dict[str, str]) -> Dict[str, Any]:
+    if ref_file_no_ext == current_file_no_ext:
+        return {"$ref": f"#/definitions/{value}"}
+
+    ref_path = os.path.relpath(ref_file_no_ext + '.json', os.path.dirname(current_file_no_ext)).replace(os.sep, '/')
+    return {"$ref": f"{ref_path}#/definitions/{value}"}
+
+def parse_struct(content: str, current_file_no_ext: str, type_map: Dict[str, str]) -> Dict[str, Any]:
     content = strip_attributes(content.strip('{}').strip())
     lines = [line.strip() for line in content.split(',') if line.strip()]
     properties = {}
@@ -89,7 +99,7 @@ def parse_struct(content: str, current_file: str, type_map: Dict[str, str]) -> D
         key, type_part = parts[0].strip(), parts[1].strip()
         optional = key.endswith('?')
         key = key.rstrip('?')
-        resolved = resolve_type(type_part, current_file, type_map)
+        resolved = resolve_type(type_part, current_file_no_ext, type_map)
         properties[key] = resolved
         if not optional:
             required.append(key)
@@ -109,6 +119,30 @@ def parse_enum(content: str) -> Dict[str, Any]:
         values.append(parsed["const"])
     return {"enum": values}
 
+def parse_use_statements(content: str, current_file_no_ext: str) -> Dict[str, str]:
+    use_pattern = re.compile(r'use\s+(?P<path>(::|super::|[\w:]+)+)(?:\s+as\s+(?P<alias>\w+))?')
+    uses = {}
+    current_parts = current_file_no_ext.split(os.sep)
+    for match in use_pattern.finditer(content):
+        path = match.group('path')
+        alias = match.group('alias')
+        parts = []
+        if path.startswith('::'):
+            parts = path[2:].split('::')
+        else:
+            scope = current_parts[:-1]
+            for part in path.split('::'):
+                if part == 'super':
+                    if scope:
+                        scope.pop()
+                else:
+                    scope.append(part)
+            parts = scope
+        typename = parts[-1]
+        resolved_path = os.path.join('koffee', *parts[:-1]).replace(os.sep, '/')
+        uses[alias or typename] = resolved_path
+    return uses
+
 # --- Compiler ---
 class McdocCompiler:
     def __init__(self, base_path: str, output_root: str):
@@ -117,54 +151,59 @@ class McdocCompiler:
         self.type_map: Dict[str, str] = {}
 
     def compile(self) -> None:
-        # First pass: collect all type names and their file paths
         for root, _, files in os.walk(self.base_path):
             for file in files:
                 if file.endswith('.mcdoc'):
                     full_path = os.path.join(root, file)
-                    with open(full_path, 'r', encoding='utf-8') as f:
-                        content = strip_attributes(strip_comments(f.read()))
-                        structs = re.findall(r'struct\s+(\w+)\s*\{', content)
-                        enums = re.findall(r'enum\s*\(\w+\)\s+(\w+)\s*\{', content)
-                        for t in structs + enums:
-                            self.type_map[t] = os.path.splitext(os.path.relpath(full_path, self.base_path))[0]
+                    rel_path = os.path.splitext(os.path.relpath(full_path, self.base_path))[0]
+                    out_path = os.path.join(self.output_root, rel_path)
+                    self._collect_types(full_path, out_path.replace(os.sep, '/'))
 
-        # Second pass: process and write schemas
         for root, _, files in os.walk(self.base_path):
             for file in files:
                 if file.endswith('.mcdoc'):
                     input_path = os.path.join(root, file)
                     self._process_file(input_path)
 
+    def _collect_types(self, full_path: str, out_path_no_ext: str):
+        with open(full_path, 'r', encoding='utf-8') as f:
+            content = strip_attributes(strip_comments(f.read()))
+            structs = re.findall(r'struct\s+(\w+)\s*\{', content)
+            enums = re.findall(r'enum\s*\(\w+\)\s+(\w+)\s*\{', content)
+            for t in structs + enums:
+                self.type_map[t] = out_path_no_ext
+
     def _process_file(self, path: str) -> None:
         with open(path, 'r', encoding='utf-8') as f:
             raw = f.read()
 
         content = strip_attributes(strip_comments(raw))
-        current_rel_path = os.path.splitext(os.path.relpath(path, self.base_path))[0]
+        rel_path_no_ext = os.path.splitext(os.path.relpath(path, self.base_path))[0]
+        uses = parse_use_statements(content, rel_path_no_ext)
+        self.type_map.update(uses)
+
         structs = re.finditer(r'struct\s+(\w+)\s*\{(.*?)\}', content, re.DOTALL)
         enums = re.finditer(r'enum\s*\(\w+\)\s+(\w+)\s*\{(.*?)\}', content, re.DOTALL)
 
-        out_path = os.path.join(self.output_root, current_rel_path + '.json')
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        out_file = os.path.join(self.output_root, rel_path_no_ext + '.json')
+        os.makedirs(os.path.dirname(out_file), exist_ok=True)
 
         schema_defs = {}
         for match in structs:
             name, body = match.groups()
-            schema_defs[name] = parse_struct(body, current_rel_path, self.type_map)
+            schema_defs[name] = parse_struct(body, rel_path_no_ext, self.type_map)
 
         for match in enums:
             name, body = match.groups()
             schema_defs[name] = parse_enum(body)
 
         if schema_defs:
-            with open(out_path, 'w', encoding='utf-8') as f:
+            with open(out_file, 'w', encoding='utf-8') as f:
                 json.dump({
                     "$schema": "http://json-schema.org/draft-07/schema#",
-                    "$id": f"{current_rel_path}.json",
                     "definitions": schema_defs
                 }, f, indent=2)
-            print(f"✅ Wrote schema: {out_path}")
+            print(f"✅ Wrote schema: {out_file}")
 
 # --- CLI ---
 if __name__ == '__main__':
