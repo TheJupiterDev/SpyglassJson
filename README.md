@@ -22,5 +22,7 @@ Enjoy the `.json` versions of your `.mcdoc`s!
 ### Credits 👥
 `mcdoc` was made by, and belongs to, the Spyglass team: https://github.com/SpyglassMC
 
+---
+
 ### License 📜
 No license. Use as you like- I don't care.
