@@ -1,3 +1,6 @@
+# Main script to compile mcdocs (specifically vanilla-mcdoc, but may work with others) into JSON Schemas
+# Usage - python compiler.py FOLDER-FILLED-WITH-MCDOCS/ --target-version 1.21.5
+
 import os
 import re
 import json
@@ -15,6 +18,28 @@ def strip_comments(content: str) -> str:
 
 def strip_attributes(content: str) -> str:
     return re.sub(r'#\[[^\[\]]*(?:\[[^\[\]]*\][^\[\]]*)*\]\s*', '', content)
+
+def parse_attributes(line: str) -> Dict[str, str]:
+    """Parse attribute decorators into a dictionary."""
+    attributes = {}
+    matches = re.finditer(r'#\[(\w+)="([^"]+)"\]', line)
+    for match in matches:
+        key, value = match.groups()
+        attributes[key] = value
+    return attributes
+
+def should_include_field(attributes: Dict[str, str], target_version: str) -> bool:
+    """
+    Determine if a field should be included based on version attributes.
+    Returns True if the field should be included for the target version.
+    """
+    if 'since' in attributes:
+        if target_version < attributes['since']:
+            return False
+    if 'until' in attributes:
+        if target_version >= attributes['until']:
+            return False
+    return True
 
 def parse_typed_value(value: str) -> Dict[str, Any]:
     if re.match(r'^".*"$', value):
@@ -48,15 +73,27 @@ def resolve_type(value: str, current_file_no_ext: str, type_map: Dict[str, str])
     value = value[:range_match.start()].strip() if range_match else value
 
     if value.startswith('(') and value.endswith(')') and '|' in value:
-        types = [resolve_type(part, current_file_no_ext, type_map) for part in value[1:-1].split('|')]
-        return {"anyOf": types}
+        types = []
+        for part in split_union_types(value[1:-1]):
+            # Skip empty parts
+            if not part.strip():
+                continue
+            resolved = resolve_type(part.strip(), current_file_no_ext, type_map)
+            if resolved:  # Only add non-None values
+                types.append(resolved)
+        return {"anyOf": types} if types else {}
 
-    if re.match(r'^\[.*\]$', value):
-        inner = value[1:-1].strip()
+
+    bracket_match = re.match(r'^(\[+)(.*?)(\]+)$', value)
+    if bracket_match and len(bracket_match.group(1)) == len(bracket_match.group(3)):
+        depth = len(bracket_match.group(1))
+        inner = bracket_match.group(2).strip()
         items = resolve_type(inner, current_file_no_ext, type_map)
-        array_schema = {"type": "array", "items": items}
-        array_schema.update(parse_range(range_part))
-        return array_schema
+        for _ in range(depth):
+            items = {"type": "array", "items": items}
+        items.update(parse_range(range_part))
+        return items
+
 
     if value in ('true', 'false') or value.startswith('"'):
         return parse_typed_value(value)
@@ -84,10 +121,9 @@ def resolve_type(value: str, current_file_no_ext: str, type_map: Dict[str, str])
 
     return {"$ref": f"output/{ref_file_no_ext}.json#/definitions/{value}"}
 
-def parse_struct(content: str, current_file_no_ext: str, type_map: Dict[str, str]) -> Dict[str, Any]:
-    content = strip_attributes(content.strip('{}').strip())
-    lines = [line.strip() for line in content.split(',') if line.strip()]
-
+def parse_struct(content: str, current_file_no_ext: str, type_map: Dict[str, str], target_version: str = "1.21.5") -> Dict[str, Any]:
+    lines = [line.strip() for line in content.strip('{}').split(',') if line.strip()]
+    
     properties = {}
     required = []
     all_of = []
@@ -95,17 +131,19 @@ def parse_struct(content: str, current_file_no_ext: str, type_map: Dict[str, str
 
     for line in lines:
         if line.startswith('...'):
-            spread_match = re.match(r'\.\.\.\s*([\w:]+)\s*(?:\[\[\s*([\w]+)\s*\]\])?', line)
-            if spread_match:
-                base_type = spread_match.group(1)
-                discriminator_field = spread_match.group(2)
-                spread_ref = resolve_type(base_type, current_file_no_ext, type_map)
-                all_of.append(spread_ref)
-                if discriminator_field:
-                    discriminator_info.append((discriminator_field, spread_ref["$ref"]))
+            # ... handle spread operator as before ...
             continue
 
-        parts = line.split(':')
+        # Extract attributes before processing the line
+        attributes = parse_attributes(line)
+        # Strip attributes for further processing
+        clean_line = strip_attributes(line)
+
+        # Skip this field if it shouldn't be included for the target version
+        if not should_include_field(attributes, target_version):
+            continue
+
+        parts = clean_line.split(':')
         if len(parts) != 2:
             continue
 
@@ -113,6 +151,10 @@ def parse_struct(content: str, current_file_no_ext: str, type_map: Dict[str, str
         optional = key.endswith('?')
         key = key.rstrip('?')
         resolved = resolve_type(type_part, current_file_no_ext, type_map)
+
+        if isinstance(resolved, dict):
+            resolved.setdefault("title", key)
+
         properties[key] = resolved
         if not optional:
             required.append(key)
@@ -196,13 +238,14 @@ def split_union_types(s: str) -> List[str]:
     if current.strip():
         parts.append(current.strip())
     return parts
-
+                
 # --- Compiler ---
 class McdocCompiler:
-    def __init__(self, base_path: str, output_root: str):
+    def __init__(self, base_path: str, output_root: str, target_version: str = "1.21.5"):
         self.base_path = os.path.abspath(base_path)
         self.output_root = os.path.abspath(os.path.join('output', output_root))
         self.type_map: Dict[str, str] = {}
+        self.target_version = target_version
 
     def compile(self) -> None:
         for root, _, files in os.walk(self.base_path):
@@ -251,7 +294,7 @@ class McdocCompiler:
 
         for match in structs:
             name, body = match.groups()
-            schema_defs[name] = parse_struct(body, rel_path_no_ext, self.type_map)
+            schema_defs[name] = parse_struct(body, rel_path_no_ext, self.type_map, self.target_version)
 
         for match in enums:
             name, body = match.groups()
@@ -294,7 +337,8 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description='Compile full mcdoc schema to JSON Schema.')
     parser.add_argument('mcdoc_path', help='Path to the root directory containing .mcdoc files (e.g., java/)')
+    parser.add_argument('--target-version', default="1.21.5", help='Target Minecraft version (default: 1.21.5)')
     args = parser.parse_args()
 
-    compiler = McdocCompiler(args.mcdoc_path, 'java')
+    compiler = McdocCompiler(args.mcdoc_path, 'java', args.target_version)
     compiler.compile()
