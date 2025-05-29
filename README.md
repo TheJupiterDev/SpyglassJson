@@ -1,7 +1,8 @@
 # SpyglassJSON 🔎
 ###### Yes, the name sucks. It will change. Maybe.
 
-> ⚠️ Notice: This project is very new and very buggy!
+⚠️ Notice: This project is very new and very buggy!
+I would not recommend using this, AT ALL, in its current state.
 
 A python script to compile `.mcdoc` to `.json` and ensure its a valid schema.
 

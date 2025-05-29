@@ -14,7 +14,7 @@ def strip_comments(content: str) -> str:
     return '\n'.join(stripped)
 
 def strip_attributes(content: str) -> str:
-    return re.sub(r'#\[.*?\]\s*', '', content, flags=re.DOTALL)
+    return re.sub(r'#\[[^\[\]]*(?:\[[^\[\]]*\][^\[\]]*)*\]\s*', '', content)
 
 def parse_typed_value(value: str) -> Dict[str, Any]:
     if re.match(r'^".*"$', value):
@@ -87,14 +87,28 @@ def resolve_type(value: str, current_file_no_ext: str, type_map: Dict[str, str])
 def parse_struct(content: str, current_file_no_ext: str, type_map: Dict[str, str]) -> Dict[str, Any]:
     content = strip_attributes(content.strip('{}').strip())
     lines = [line.strip() for line in content.split(',') if line.strip()]
+
     properties = {}
     required = []
+    all_of = []
+    discriminator_info = []
+
     for line in lines:
         if line.startswith('...'):
+            spread_match = re.match(r'\.\.\.\s*([\w:]+)\s*(?:\[\[\s*([\w]+)\s*\]\])?', line)
+            if spread_match:
+                base_type = spread_match.group(1)
+                discriminator_field = spread_match.group(2)
+                spread_ref = resolve_type(base_type, current_file_no_ext, type_map)
+                all_of.append(spread_ref)
+                if discriminator_field:
+                    discriminator_info.append((discriminator_field, spread_ref["$ref"]))
             continue
+
         parts = line.split(':')
         if len(parts) != 2:
             continue
+
         key, type_part = parts[0].strip(), parts[1].strip()
         optional = key.endswith('?')
         key = key.rstrip('?')
@@ -102,10 +116,29 @@ def parse_struct(content: str, current_file_no_ext: str, type_map: Dict[str, str
         properties[key] = resolved
         if not optional:
             required.append(key)
-    struct_schema = {"type": "object", "properties": properties}
+
+    base_object = {"type": "object", "properties": properties}
     if required:
-        struct_schema["required"] = required
-    return struct_schema
+        base_object["required"] = required
+
+    if not all_of:
+        return base_object
+
+    all_of.insert(0, base_object)
+    result = {"allOf": all_of}
+
+    # Attach discriminator if valid and consistent
+    if discriminator_info:
+        field_names = {field for field, _ in discriminator_info}
+        if len(field_names) == 1:
+            discriminator_field = field_names.pop()
+            mapping = {ref.split('/')[-1]: ref for _, ref in discriminator_info}
+            result["discriminator"] = {
+                "propertyName": discriminator_field,
+                "mapping": mapping
+            }
+
+    return result
 
 def parse_enum(content: str) -> Dict[str, Any]:
     content = content.strip('{}').strip()
@@ -234,7 +267,7 @@ class McdocCompiler:
                 for part in parts:
                     # If it's a full struct definition, try to extract the name
                     if part.startswith('struct'):
-                        struct_match = re.match(r'struct\s+\w+\s*\{(.*)\}', part, re.DOTALL)
+                        struct_match = re.match(r'struct(?:\s+\w+)?\s*\{(.*)\}', part, re.DOTALL)
                         if struct_match:
                             refs.append(parse_struct('{' + struct_match.group(1) + '}', rel_path_no_ext, self.type_map))
                         else:
