@@ -1,344 +1,872 @@
-# Main script to compile mcdocs (specifically vanilla-mcdoc, but may work with others) into JSON Schemas
-# Usage - python compiler.py FOLDER-FILLED-WITH-MCDOCS/ --target-version 1.21.5
+#!/usr/bin/env python3
+"""
+Full Mcdoc to JSON Compiler
+
+A comprehensive compiler that converts mcdoc files and folder structures into JSON schemas.
+Based on the official mcdoc specification from spyglassmc.com.
+
+Usage:
+    python mcdoc_compiler.py <input_folder> <output_folder>
+"""
 
 import os
-import re
+import sys
 import json
-from typing import Any, Dict, List, Optional
+import re
+from pathlib import Path
+from typing import Dict, List, Any, Optional, Union, Tuple, Set
+from dataclasses import dataclass, field
+from enum import Enum
 
-# --- Helper Utilities ---
-def strip_comments(content: str) -> str:
-    lines = content.splitlines()
-    stripped = []
-    for line in lines:
-        line = re.sub(r'//.*', '', line).strip()
-        if line:
-            stripped.append(line)
-    return '\n'.join(stripped)
-
-def strip_attributes(content: str) -> str:
-    return re.sub(r'#\[[^\[\]]*(?:\[[^\[\]]*\][^\[\]]*)*\]\s*', '', content)
-
-def parse_attributes(line: str) -> Dict[str, str]:
-    """Parse attribute decorators into a dictionary."""
-    attributes = {}
-    matches = re.finditer(r'#\[(\w+)="([^"]+)"\]', line)
-    for match in matches:
-        key, value = match.groups()
-        attributes[key] = value
-    return attributes
-
-def should_include_field(attributes: Dict[str, str], target_version: str) -> bool:
-    """
-    Determine if a field should be included based on version attributes.
-    Returns True if the field should be included for the target version.
-    """
-    if 'since' in attributes:
-        if target_version < attributes['since']:
-            return False
-    if 'until' in attributes:
-        if target_version >= attributes['until']:
-            return False
-    return True
-
-def parse_typed_value(value: str) -> Dict[str, Any]:
-    if re.match(r'^".*"$', value):
-        return {"const": value.strip('"'), "type": "string"}
-    if value in ('true', 'false'):
-        return {"const": value == 'true', "type": "boolean"}
-    if re.match(r'^-?\d+(\.\d+)?([eE][+-]?\d+)?[bBsSlLfFdD]?$' , value):
-        if value[-1].lower() in 'bsil':
-            return {"const": int(value[:-1]), "type": "integer"}
-        return {"const": float(value.rstrip('dDfF')), "type": "number"}
-    return {"const": value}
-
-def parse_range(range_str: str) -> Dict[str, int]:
-    result = {}
-    match = re.match(r'@\s*(\d+)?\.\.(\d+)?', range_str)
-    if match:
-        if match.group(1):
-            result['minItems'] = int(match.group(1))
-        if match.group(2):
-            result['maxItems'] = int(match.group(2))
-    return result
-
-def resolve_type(value: str, current_file_no_ext: str, type_map: Dict[str, str]) -> Any:
-    value = value.strip()
-
-    if value == '()':
-        return False
-
-    range_match = re.search(r'@\s*[\d.<]+', value)
-    range_part = value[range_match.start():] if range_match else ''
-    value = value[:range_match.start()].strip() if range_match else value
-
-    if value.startswith('(') and value.endswith(')') and '|' in value:
-        types = []
-        for part in split_union_types(value[1:-1]):
-            # Skip empty parts
-            if not part.strip():
-                continue
-            resolved = resolve_type(part.strip(), current_file_no_ext, type_map)
-            if resolved:  # Only add non-None values
-                types.append(resolved)
-        return {"anyOf": types} if types else {}
-
-
-    bracket_match = re.match(r'^(\[+)(.*?)(\]+)$', value)
-    if bracket_match and len(bracket_match.group(1)) == len(bracket_match.group(3)):
-        depth = len(bracket_match.group(1))
-        inner = bracket_match.group(2).strip()
-        items = resolve_type(inner, current_file_no_ext, type_map)
-        for _ in range(depth):
-            items = {"type": "array", "items": items}
-        items.update(parse_range(range_part))
-        return items
-
-
-    if value in ('true', 'false') or value.startswith('"'):
-        return parse_typed_value(value)
-
-    type_map_builtins = {
-        'string': {"type": "string"},
-        'boolean': {"type": "boolean"},
-        'byte': {"type": "integer"},
-        'short': {"type": "integer"},
-        'int': {"type": "integer"},
-        'long': {"type": "integer"},
-        'float': {"type": "number"},
-        'double': {"type": "number"},
-        'any': {},
-    }
-    if value in type_map_builtins:
-        return type_map_builtins[value]
-
-    ref_file_no_ext = type_map.get(value)
-    if not ref_file_no_ext:
-        return {"$ref": f"#/definitions/{value}"}  # fallback if unknown
-
-    if ref_file_no_ext == current_file_no_ext:
-        return {"$ref": f"#/definitions/{value}"}
-
-    return {"$ref": f"output/{ref_file_no_ext}.json#/definitions/{value}"}
-
-def parse_struct(content: str, current_file_no_ext: str, type_map: Dict[str, str], target_version: str = "1.21.5") -> Dict[str, Any]:
-    lines = [line.strip() for line in content.strip('{}').split(',') if line.strip()]
+# Token types for lexical analysis
+class TokenType(Enum):
+    # Literals
+    INTEGER = "INTEGER"
+    FLOAT = "FLOAT" 
+    STRING = "STRING"
+    BOOLEAN = "BOOLEAN"
+    RESOURCE_LOCATION = "RESOURCE_LOCATION"
+    IDENTIFIER = "IDENTIFIER"
     
-    properties = {}
-    required = []
-    all_of = []
-    discriminator_info = []
+    # Keywords
+    STRUCT = "struct"
+    ENUM = "enum"
+    TYPE = "type"
+    USE = "use"
+    DISPATCH = "dispatch"
+    SUPER = "super"
+    ANY = "any"
+    BOOLEAN_TYPE = "boolean"
+    STRING_TYPE = "string"
+    BYTE = "byte"
+    SHORT = "short"
+    INT = "int"
+    LONG = "long"
+    FLOAT_TYPE = "float"
+    DOUBLE = "double"
+    TRUE = "true"
+    FALSE = "false"
+    TO = "to"
+    
+    # Special keys
+    FALLBACK = "%fallback"
+    NONE = "%none"
+    UNKNOWN = "%unknown"
+    KEY = "%key"
+    PARENT = "%parent"
+    
+    # Symbols
+    LBRACE = "{"
+    RBRACE = "}"
+    LBRACKET = "["
+    RBRACKET = "]"
+    LPAREN = "("
+    RPAREN = ")"
+    LANGLE = "<"
+    RANGLE = ">"
+    COLON = ":"
+    SEMICOLON = ";"
+    COMMA = ","
+    DOT = "."
+    QUESTION = "?"
+    PIPE = "|"
+    AMPERSAND = "&"
+    EQUALS = "="
+    HASH = "#"
+    AT = "@"
+    ELLIPSIS = "..."
+    DOUBLE_COLON = "::"
+    RANGE = ".."
+    EXCLUSIVE_RANGE = "<.."
+    RANGE_EXCLUSIVE = "..<"
+    EXCLUSIVE_RANGE_EXCLUSIVE = "<..<"
+    
+    # Special
+    EOF = "EOF"
+    NEWLINE = "NEWLINE"
+    COMMENT = "COMMENT"
+    DOC_COMMENT = "DOC_COMMENT"
+    WHITESPACE = "WHITESPACE"
 
-    for line in lines:
-        if line.startswith('...'):
-            # ... handle spread operator as before ...
-            continue
+@dataclass
+class Token:
+    type: TokenType
+    value: str
+    line: int
+    column: int
 
-        # Extract attributes before processing the line
-        attributes = parse_attributes(line)
-        # Strip attributes for further processing
-        clean_line = strip_attributes(line)
+@dataclass 
+class Position:
+    line: int
+    column: int
 
-        # Skip this field if it shouldn't be included for the target version
-        if not should_include_field(attributes, target_version):
-            continue
+class LexerError(Exception):
+    def __init__(self, message: str, position: Position):
+        self.message = message
+        self.position = position
+        super().__init__(f"Line {position.line}, Column {position.column}: {message}")
 
-        parts = clean_line.split(':')
-        if len(parts) != 2:
-            continue
+class ParseError(Exception):
+    def __init__(self, message: str, token: Token):
+        self.message = message
+        self.token = token
+        super().__init__(f"Line {token.line}, Column {token.column}: {message}")
 
-        key, type_part = parts[0].strip(), parts[1].strip()
-        optional = key.endswith('?')
-        key = key.rstrip('?')
-        resolved = resolve_type(type_part, current_file_no_ext, type_map)
-
-        if isinstance(resolved, dict):
-            resolved.setdefault("title", key)
-
-        properties[key] = resolved
-        if not optional:
-            required.append(key)
-
-    base_object = {"type": "object", "properties": properties}
-    if required:
-        base_object["required"] = required
-
-    if not all_of:
-        return base_object
-
-    all_of.insert(0, base_object)
-    result = {"allOf": all_of}
-
-    # Attach discriminator if valid and consistent
-    if discriminator_info:
-        field_names = {field for field, _ in discriminator_info}
-        if len(field_names) == 1:
-            discriminator_field = field_names.pop()
-            mapping = {ref.split('/')[-1]: ref for _, ref in discriminator_info}
-            result["discriminator"] = {
-                "propertyName": discriminator_field,
-                "mapping": mapping
-            }
-
-    return result
-
-def parse_enum(content: str) -> Dict[str, Any]:
-    content = content.strip('{}').strip()
-    values = []
-    for line in content.split(','):
-        if '=' not in line:
-            continue
-        _, val = map(str.strip, line.split('=', 1))
-        parsed = parse_typed_value(val)
-        values.append(parsed["const"])
-    return {"enum": values}
-
-def parse_use_statements(content: str, current_file_no_ext: str) -> Dict[str, str]:
-    use_pattern = re.compile(r'use\s+(?P<path>(::|super::|[\w:]+)+)(?:\s+as\s+(?P<alias>\w+))?')
-    uses = {}
-    current_parts = current_file_no_ext.split(os.sep)
-
-    for match in use_pattern.finditer(content):
-        path = match.group('path')
-        alias = match.group('alias')
-        parts = []
-
-        if path.startswith('::'):
-            parts = path[2:].split('::')
+class Lexer:
+    """Lexical analyzer for mcdoc files"""
+    
+    KEYWORDS = {
+        'struct': TokenType.STRUCT,
+        'enum': TokenType.ENUM,
+        'type': TokenType.TYPE,
+        'use': TokenType.USE,
+        'dispatch': TokenType.DISPATCH,
+        'super': TokenType.SUPER,
+        'any': TokenType.ANY,
+        'boolean': TokenType.BOOLEAN_TYPE,
+        'string': TokenType.STRING_TYPE,
+        'byte': TokenType.BYTE,
+        'short': TokenType.SHORT,
+        'int': TokenType.INT,
+        'long': TokenType.LONG,
+        'float': TokenType.FLOAT_TYPE,
+        'double': TokenType.DOUBLE,
+        'true': TokenType.TRUE,
+        'false': TokenType.FALSE,
+        'to': TokenType.TO
+    }
+    
+    def __init__(self, text: str):
+        self.text = text
+        self.pos = 0
+        self.line = 1
+        self.column = 1
+        self.tokens = []
+    
+    def error(self, message: str):
+        raise LexerError(message, Position(self.line, self.column))
+    
+    def peek(self, offset: int = 0) -> str:
+        pos = self.pos + offset
+        if pos >= len(self.text):
+            return '\0'
+        return self.text[pos]
+    
+    def advance(self) -> str:
+        if self.pos >= len(self.text):
+            return '\0'
+        
+        char = self.text[self.pos]
+        self.pos += 1
+        
+        if char == '\n':
+            self.line += 1
+            self.column = 1
         else:
-            scope = current_parts[:-1]
-            for part in path.split('::'):
-                if part == 'super':
-                    if scope:
-                        scope.pop()
-                else:
-                    scope.append(part)
-            parts = scope
-
-        typename = parts[-1]
-        resolved_path = '/'.join(parts[:-1]) if len(parts) > 1 else ''
-        uses[alias or typename] = resolved_path
-
-    return uses
-
-def split_union_types(s: str) -> List[str]:
-    parts = []
-    current = ''
-    depth = 0
-    for c in s:
-        if c == '|' and depth == 0:
-            parts.append(current.strip())
-            current = ''
-        else:
-            current += c
-            if c in '([{':
-                depth += 1
-            elif c in ')]}':
-                depth = max(0, depth - 1)
-    if current.strip():
-        parts.append(current.strip())
-    return parts
-                
-# --- Compiler ---
-class McdocCompiler:
-    def __init__(self, base_path: str, output_root: str, target_version: str = "1.21.5"):
-        self.base_path = os.path.abspath(base_path)
-        self.output_root = os.path.abspath(os.path.join('output', output_root))
-        self.type_map: Dict[str, str] = {}
-        self.target_version = target_version
-
-    def compile(self) -> None:
-        for root, _, files in os.walk(self.base_path):
-            for file in files:
-                if file.endswith('.mcdoc'):
-                    full_path = os.path.join(root, file)
-                    rel_path = os.path.splitext(os.path.relpath(full_path, self.base_path))[0]
-                    out_path = os.path.join(self.output_root, rel_path)
-                    self._collect_types(full_path, out_path.replace(os.sep, '/'))
-
-        for root, _, files in os.walk(self.base_path):
-            for file in files:
-                if file.endswith('.mcdoc'):
-                    input_path = os.path.join(root, file)
-                    self._process_file(input_path)
-
-    def _collect_types(self, full_path: str, out_path_no_ext: str):
-        with open(full_path, 'r', encoding='utf-8') as f:
-            content = strip_attributes(strip_comments(f.read()))
-            structs = re.findall(r'struct\s+(\w+)\s*\{', content)
-            enums = re.findall(r'enum\s*\(\w+\)\s+(\w+)\s*\{', content)
+            self.column += 1
             
-            rel_path_no_ext = os.path.relpath(full_path, self.base_path)
-            rel_path_no_ext = os.path.splitext(rel_path_no_ext)[0].replace(os.sep, '/')
-
-            for t in structs + enums:
-                self.type_map[t] = rel_path_no_ext
-
-    def _process_file(self, path: str) -> None:
-        with open(path, 'r', encoding='utf-8') as f:
-            raw = f.read()
-
-        content = strip_attributes(strip_comments(raw))
-        rel_path_no_ext = os.path.splitext(os.path.relpath(path, self.base_path))[0].replace(os.sep, '/')
-        uses = parse_use_statements(content, rel_path_no_ext)
-        self.type_map.update(uses)
-
-        structs = re.finditer(r'struct\s+(\w+)\s*\{(.*?)\}', content, re.DOTALL)
-        enums = re.finditer(r'enum\s*\(\w+\)\s+(\w+)\s*\{(.*?)\}', content, re.DOTALL)
-        types = re.finditer(r'type\s+(\w+)\s*=\s*(\((?:[^()]*|\([^()]*\))*\)|[^\n]*)', content, re.DOTALL)
-
-        out_file = os.path.join(self.output_root, rel_path_no_ext + '.json')
-        os.makedirs(os.path.dirname(out_file), exist_ok=True)
-
-        schema_defs = {}
-
-        for match in structs:
-            name, body = match.groups()
-            schema_defs[name] = parse_struct(body, rel_path_no_ext, self.type_map, self.target_version)
-
-        for match in enums:
-            name, body = match.groups()
-            schema_defs[name] = parse_enum(body)
-
-        for match in types:
-            name, body = match.groups()
-            body = body.strip()
-
-            if body.startswith('(') and body.endswith(')'):
-                parts = split_union_types(body[1:-1])
-                refs = []
-                for part in parts:
-                    # If it's a full struct definition, try to extract the name
-                    if part.startswith('struct'):
-                        struct_match = re.match(r'struct(?:\s+\w+)?\s*\{(.*)\}', part, re.DOTALL)
-                        if struct_match:
-                            refs.append(parse_struct('{' + struct_match.group(1) + '}', rel_path_no_ext, self.type_map))
-                        else:
-                            print(f"⚠️ Could not parse inline struct: {part}")
-                    else:
-                        refs.append(resolve_type(part, rel_path_no_ext, self.type_map))
-
-
-                schema_defs[name] = { "anyOf": refs }
+        return char
+    
+    def skip_whitespace(self):
+        while self.peek().isspace() and self.peek() != '\n':
+            self.advance()
+    
+    def read_string(self) -> str:
+        quote = self.advance()  # Skip opening quote
+        value = ""
+        
+        while self.peek() != quote and self.peek() != '\0':
+            if self.peek() == '\\':
+                self.advance()  # Skip backslash
+                escaped = self.advance()
+                escape_map = {
+                    'n': '\n', 't': '\t', 'r': '\r', '\\': '\\',
+                    '"': '"', "'": "'", 'b': '\b', 'f': '\f'
+                }
+                value += escape_map.get(escaped, escaped)
             else:
-                schema_defs[name] = resolve_type(body, rel_path_no_ext, self.type_map)
+                value += self.advance()
+        
+        if self.peek() == '\0':
+            self.error("Unterminated string")
+        
+        self.advance()  # Skip closing quote
+        return value
+    
+    def read_number(self) -> Tuple[str, TokenType]:
+        value = ""
+        has_dot = False
+        
+        # Handle negative numbers
+        if self.peek() == '-' or self.peek() == '+':
+            value += self.advance()
+        
+        while self.peek().isdigit() or (self.peek() == '.' and not has_dot):
+            if self.peek() == '.':
+                # Check if it's a range operator
+                if self.peek(1) == '.':
+                    break
+                has_dot = True
+            value += self.advance()
+        
+        # Handle scientific notation
+        if self.peek().lower() == 'e':
+            value += self.advance()
+            if self.peek() in '+-':
+                value += self.advance()
+            while self.peek().isdigit():
+                value += self.advance()
+            has_dot = True
+        
+        # Handle typed numbers (suffixes)
+        if self.peek().lower() in 'bslfd':
+            suffix = self.advance().lower()
+            return value + suffix, TokenType.FLOAT if suffix in 'fd' else TokenType.INTEGER
+        
+        return value, TokenType.FLOAT if has_dot else TokenType.INTEGER
+    
+    def read_identifier(self) -> str:
+        value = ""
+        while (self.peek().isalnum() or self.peek() in '_'):
+            value += self.advance()
+        return value
+    
+    def read_comment(self) -> Tuple[str, TokenType]:
+        content = ""
+        if self.peek() == '/' and self.peek(1) == '/':
+            self.advance()  # Skip first /
+            self.advance()  # Skip second /
+            
+            # Check for doc comment
+            is_doc = self.peek() == '/'
+            if is_doc:
+                self.advance()  # Skip third /
+            
+            while self.peek() != '\n' and self.peek() != '\0':
+                content += self.advance()
+            
+            return content.strip(), TokenType.DOC_COMMENT if is_doc else TokenType.COMMENT
+        
+        return content, TokenType.COMMENT
+    
+    def tokenize(self) -> List[Token]:
+        self.tokens = []
+        
+        while self.pos < len(self.text):
+            start_line = self.line
+            start_column = self.column
+            
+            char = self.peek()
+            
+            if char == '\0':
+                break
+            elif char == '\n':
+                self.advance()
+                self.tokens.append(Token(TokenType.NEWLINE, '\\n', start_line, start_column))
+            elif char.isspace():
+                self.skip_whitespace()
+            elif char == '/' and self.peek(1) == '/':
+                content, token_type = self.read_comment()
+                if token_type == TokenType.DOC_COMMENT:
+                    self.tokens.append(Token(token_type, content, start_line, start_column))
+            elif char in '"\'':
+                value = self.read_string()
+                self.tokens.append(Token(TokenType.STRING, value, start_line, start_column))
+            elif char.isdigit() or (char in '+-' and self.peek(1).isdigit()):
+                value, token_type = self.read_number()
+                self.tokens.append(Token(token_type, value, start_line, start_column))
+            elif char.isalpha() or char == '_':
+                value = self.read_identifier()
+                token_type = self.KEYWORDS.get(value, TokenType.IDENTIFIER)
+                if value in ['true', 'false']:
+                    token_type = TokenType.BOOLEAN
+                self.tokens.append(Token(token_type, value, start_line, start_column))
+            elif char == ':':
+                if self.peek(1) == ':':
+                    self.advance()
+                    self.advance()
+                    self.tokens.append(Token(TokenType.DOUBLE_COLON, '::', start_line, start_column))
+                else:
+                    self.advance()
+                    self.tokens.append(Token(TokenType.COLON, ':', start_line, start_column))
+            elif char == '.':
+                if self.peek(1) == '.' and self.peek(2) == '.':
+                    self.advance()
+                    self.advance()
+                    self.advance()
+                    self.tokens.append(Token(TokenType.ELLIPSIS, '...', start_line, start_column))
+                elif self.peek(1) == '.':
+                    self.advance()
+                    self.advance()
+                    if self.peek() == '<':
+                        self.advance()
+                        self.tokens.append(Token(TokenType.RANGE_EXCLUSIVE, '..<', start_line, start_column))
+                    else:
+                        self.tokens.append(Token(TokenType.RANGE, '..', start_line, start_column))
+                else:
+                    self.advance()
+                    self.tokens.append(Token(TokenType.DOT, '.', start_line, start_column))
+            elif char == '<':
+                if self.peek(1) == '.' and self.peek(2) == '.':
+                    self.advance()
+                    self.advance()
+                    self.advance()
+                    if self.peek() == '<':
+                        self.advance()
+                        self.tokens.append(Token(TokenType.EXCLUSIVE_RANGE_EXCLUSIVE, '<..<', start_line, start_column))
+                    else:
+                        self.tokens.append(Token(TokenType.EXCLUSIVE_RANGE, '<..', start_line, start_column))
+                else:
+                    self.advance()
+                    self.tokens.append(Token(TokenType.LANGLE, '<', start_line, start_column))
+            elif char == '%':
+                self.advance()
+                identifier = self.read_identifier()
+                special_key = f"%{identifier}"
+                
+                special_tokens = {
+                    "%fallback": TokenType.FALLBACK,
+                    "%none": TokenType.NONE,
+                    "%unknown": TokenType.UNKNOWN,
+                    "%key": TokenType.KEY,
+                    "%parent": TokenType.PARENT
+                }
+                
+                token_type = special_tokens.get(special_key, TokenType.IDENTIFIER)
+                self.tokens.append(Token(token_type, special_key, start_line, start_column))
+            else:
+                # Single character tokens
+                char_map = {
+                    '{': TokenType.LBRACE, '}': TokenType.RBRACE,
+                    '[': TokenType.LBRACKET, ']': TokenType.RBRACKET,
+                    '(': TokenType.LPAREN, ')': TokenType.RPAREN,
+                    '>': TokenType.RANGLE, ';': TokenType.SEMICOLON,
+                    ',': TokenType.COMMA, '?': TokenType.QUESTION,
+                    '|': TokenType.PIPE, '&': TokenType.AMPERSAND,
+                    '=': TokenType.EQUALS, '#': TokenType.HASH,
+                    '@': TokenType.AT
+                }
+                
+                if char in char_map:
+                    self.advance()
+                    self.tokens.append(Token(char_map[char], char, start_line, start_column))
+                else:
+                    self.error(f"Unexpected character: {char}")
+        
+        self.tokens.append(Token(TokenType.EOF, '', self.line, self.column))
+        return self.tokens
 
-        if schema_defs:
-            with open(out_file, 'w', encoding='utf-8') as f:
-                json.dump({
-                    "$schema": "http://json-schema.org/draft-07/schema#",
-                    "definitions": schema_defs
-                }, f, indent=2)
-            print(f"✅ Wrote schema: {out_file}")
+# AST Node definitions
+@dataclass
+class ASTNode:
+    line: int
+    column: int
 
-# --- CLI ---
-if __name__ == '__main__':
-    import argparse
+@dataclass 
+class Type(ASTNode):
+    pass
 
-    parser = argparse.ArgumentParser(description='Compile full mcdoc schema to JSON Schema.')
-    parser.add_argument('mcdoc_path', help='Path to the root directory containing .mcdoc files (e.g., java/)')
-    parser.add_argument('--target-version', default="1.21.5", help='Target Minecraft version (default: 1.21.5)')
-    args = parser.parse_args()
+@dataclass
+class AnyType(Type):
+    pass
 
-    compiler = McdocCompiler(args.mcdoc_path, 'java', args.target_version)
-    compiler.compile()
+@dataclass
+class BooleanType(Type):
+    pass
+
+@dataclass
+class StringType(Type):
+    range: Optional['NumberRange'] = None
+
+@dataclass
+class NumericType(Type):
+    type_name: str  # byte, short, int, long, float, double
+    range: Optional['NumberRange'] = None
+
+@dataclass
+class LiteralType(Type):
+    value: Any
+    type_name: Optional[str] = None
+
+@dataclass
+class PrimitiveArrayType(Type):
+    element_type: str
+    value_range: Optional['NumberRange'] = None
+    size_range: Optional['NumberRange'] = None
+
+@dataclass
+class ListType(Type):
+    element_type: Type
+    size_range: Optional['NumberRange'] = None
+
+@dataclass
+class TupleType(Type):
+    element_types: List[Type]
+
+@dataclass
+class UnionType(Type):
+    types: List[Type]
+
+@dataclass
+class ReferenceType(Type):
+    path: str
+    type_args: List[Type] = field(default_factory=list)
+
+@dataclass
+class IndexedType(Type):
+    base_type: Type
+    indices: List[Union[str, 'DynamicIndex']]
+
+@dataclass
+class DynamicIndex:
+    path: List[str]
+
+@dataclass
+class NumberRange:
+    min_value: Optional[float] = None
+    max_value: Optional[float] = None
+    min_exclusive: bool = False
+    max_exclusive: bool = False
+
+@dataclass
+class StructField:
+    name: str
+    type: Type
+    optional: bool = False
+    doc_comment: Optional[str] = None
+
+@dataclass
+class StructType(Type):
+    fields: List[StructField]
+    spreads: List[Type] = field(default_factory=list)
+
+@dataclass
+class EnumVariant:
+    name: str
+    value: Optional[int] = None
+    doc_comment: Optional[str] = None
+
+@dataclass
+class EnumType(Type):
+    variants: List[EnumVariant]
+
+@dataclass 
+class TypeAlias(ASTNode):
+    name: str
+    type_params: List[str]
+    target_type: Type
+    doc_comment: Optional[str] = None
+
+@dataclass
+class UseStatement(ASTNode):
+    path: str
+    alias: Optional[str] = None
+
+@dataclass
+class DispatchStatement(ASTNode):
+    dispatcher: str
+    indices: List[str]
+    target_type: Type
+
+@dataclass
+class Injection(ASTNode):
+    target_path: str
+    fields: List[StructField]
+
+@dataclass
+class Module(ASTNode):
+    statements: List[Union[TypeAlias, UseStatement, DispatchStatement, Injection, StructType, EnumType]]
+    doc_comments: Dict[str, str] = field(default_factory=dict)
+
+class Parser:
+    """Parser for mcdoc syntax"""
+    
+    def __init__(self, tokens: List[Token]):
+        self.tokens = tokens
+        self.pos = 0
+        self.current_token = tokens[0] if tokens else Token(TokenType.EOF, '', 0, 0)
+    
+    def error(self, message: str):
+        raise ParseError(message, self.current_token)
+    
+    def advance(self):
+        if self.pos < len(self.tokens) - 1:
+            self.pos += 1
+            self.current_token = self.tokens[self.pos]
+        return self.current_token
+    
+    def peek(self, offset: int = 1) -> Token:
+        pos = self.pos + offset
+        if pos >= len(self.tokens):
+            return Token(TokenType.EOF, '', 0, 0)
+        return self.tokens[pos]
+    
+    def match(self, *token_types: TokenType) -> bool:
+        return self.current_token.type in token_types
+    
+    def consume(self, token_type: TokenType, message: str = None) -> Token:
+        if self.current_token.type != token_type:
+            if message is None:
+                message = f"Expected {token_type}, got {self.current_token.type}"
+            self.error(message)
+        
+        token = self.current_token
+        self.advance()
+        return token
+    
+    def skip_newlines(self):
+        while self.match(TokenType.NEWLINE):
+            self.advance()
+    
+    def parse_module(self) -> Module:
+        statements = []
+        doc_comments = {}
+        
+        while not self.match(TokenType.EOF):
+            self.skip_newlines()
+            
+            if self.match(TokenType.EOF):
+                break
+            
+            # Collect doc comments
+            current_doc = None
+            if self.match(TokenType.DOC_COMMENT):
+                doc_lines = []
+                while self.match(TokenType.DOC_COMMENT):
+                    doc_lines.append(self.current_token.value)
+                    self.advance()
+                current_doc = '\n'.join(doc_lines)
+                self.skip_newlines()
+            
+            if self.match(TokenType.STRUCT):
+                stmt = self.parse_struct()
+                statements.append(stmt)
+            elif self.match(TokenType.ENUM):
+                stmt = self.parse_enum()
+                statements.append(stmt)
+            elif self.match(TokenType.TYPE):
+                stmt = self.parse_type_alias()
+                if current_doc:
+                    stmt.doc_comment = current_doc
+                statements.append(stmt)
+            elif self.match(TokenType.USE):
+                statements.append(self.parse_use_statement())
+            elif self.match(TokenType.DISPATCH):
+                statements.append(self.parse_dispatch_statement())
+            else:
+                self.error(f"Unexpected token: {self.current_token.type}")
+            
+            self.skip_newlines()
+        
+        return Module(0, 0, statements, doc_comments)
+    
+    def parse_struct(self) -> StructType:
+        line, col = self.current_token.line, self.current_token.column
+        self.consume(TokenType.STRUCT)
+        self.consume(TokenType.LBRACE)
+        
+        fields = []
+        spreads = []
+        
+        while not self.match(TokenType.RBRACE):
+            self.skip_newlines()
+            
+            if self.match(TokenType.RBRACE):
+                break
+            
+            # Doc comment for field
+            field_doc = None
+            if self.match(TokenType.DOC_COMMENT):
+                field_doc = self.current_token.value
+                self.advance()
+                self.skip_newlines()
+            
+            # Spread operator
+            if self.match(TokenType.ELLIPSIS):
+                self.advance()
+                spread_type = self.parse_type()
+                spreads.append(spread_type)
+            else:
+                # Regular field
+                field_name = self.consume(TokenType.IDENTIFIER).value
+                
+                # Optional field
+                optional = False
+                if self.match(TokenType.QUESTION):
+                    optional = True
+                    self.advance()
+                
+                self.consume(TokenType.COLON)
+                field_type = self.parse_type()
+                
+                field = StructField(field_name, field_type, optional, field_doc)
+                fields.append(field)
+            
+            # Optional comma
+            if self.match(TokenType.COMMA):
+                self.advance()
+            
+            self.skip_newlines()
+        
+        self.consume(TokenType.RBRACE)
+        return StructType(line, col, fields, spreads)
+    
+    def parse_enum(self) -> EnumType:
+        line, col = self.current_token.line, self.current_token.column
+        self.consume(TokenType.ENUM)
+        self.consume(TokenType.LBRACE)
+        
+        variants = []
+        
+        while not self.match(TokenType.RBRACE):
+            self.skip_newlines()
+            
+            if self.match(TokenType.RBRACE):
+                break
+            
+            # Doc comment for variant
+            variant_doc = None
+            if self.match(TokenType.DOC_COMMENT):
+                variant_doc = self.current_token.value
+                self.advance()
+                self.skip_newlines()
+            
+            variant_name = self.consume(TokenType.IDENTIFIER).value
+            
+            # Optional value
+            variant_value = None
+            if self.match(TokenType.EQUALS):
+                self.advance()
+                if self.match(TokenType.INTEGER):
+                    variant_value = int(self.current_token.value)
+                    self.advance()
+                else:
+                    self.error("Expected integer value for enum variant")
+            
+            variant = EnumVariant(variant_name, variant_value, variant_doc)
+            variants.append(variant)
+            
+            # Optional comma
+            if self.match(TokenType.COMMA):
+                self.advance()
+            
+            self.skip_newlines()
+        
+        self.consume(TokenType.RBRACE)
+        return EnumType(line, col, variants)
+    
+    def parse_type_alias(self) -> TypeAlias:
+        line, col = self.current_token.line, self.current_token.column
+        self.consume(TokenType.TYPE)
+        
+        name = self.consume(TokenType.IDENTIFIER).value
+        
+        # Type parameters
+        type_params = []
+        if self.match(TokenType.LANGLE):
+            self.advance()
+            while not self.match(TokenType.RANGLE):
+                param = self.consume(TokenType.IDENTIFIER).value
+                type_params.append(param)
+                
+                if self.match(TokenType.COMMA):
+                    self.advance()
+                elif not self.match(TokenType.RANGLE):
+                    self.error("Expected ',' or '>' in type parameters")
+            
+            self.consume(TokenType.RANGLE)
+        
+        self.consume(TokenType.EQUALS)
+        target_type = self.parse_type()
+        
+        return TypeAlias(line, col, name, type_params, target_type)
+    
+    def parse_use_statement(self) -> UseStatement:
+        line, col = self.current_token.line, self.current_token.column
+        self.consume(TokenType.USE)
+        
+        path = self.parse_path()
+        
+        alias = None
+        if self.match(TokenType.AS):
+            self.advance()
+            alias = self.consume(TokenType.IDENTIFIER).value
+        
+        return UseStatement(line, col, path, alias)
+    
+    def parse_dispatch_statement(self) -> DispatchStatement:
+        line, col = self.current_token.line, self.current_token.column
+        self.consume(TokenType.DISPATCH)
+        
+        dispatcher = self.consume(TokenType.IDENTIFIER).value
+        
+        indices = []
+        if self.match(TokenType.LBRACKET):
+            self.advance()
+            while not self.match(TokenType.RBRACKET):
+                if self.match(TokenType.IDENTIFIER):
+                    indices.append(self.current_token.value)
+                    self.advance()
+                else:
+                    self.error("Expected identifier in dispatch indices")
+                
+                if self.match(TokenType.COMMA):
+                    self.advance()
+                elif not self.match(TokenType.RBRACKET):
+                    self.error("Expected ',' or ']' in dispatch indices")
+            
+            self.consume(TokenType.RBRACKET)
+        
+        self.consume(TokenType.TO)
+        target_type = self.parse_type()
+        
+        return DispatchStatement(line, col, dispatcher, indices, target_type)
+    
+    def parse_type(self) -> Type:
+        return self.parse_union_type()
+    
+    def parse_union_type(self) -> Type:
+        left = self.parse_primary_type()
+        
+        if self.match(TokenType.PIPE):
+            types = [left]
+            while self.match(TokenType.PIPE):
+                self.advance()
+                types.append(self.parse_primary_type())
+            return UnionType(left.line, left.column, types)
+        
+        return left
+    
+    def parse_primary_type(self) -> Type:
+        line, col = self.current_token.line, self.current_token.column
+        
+        if self.match(TokenType.ANY):
+            self.advance()
+            return AnyType(line, col)
+        elif self.match(TokenType.BOOLEAN_TYPE):
+            self.advance()
+            return BooleanType(line, col)
+        elif self.match(TokenType.STRING_TYPE):
+            self.advance()
+            # Optional length constraint
+            range_def = None
+            if self.match(TokenType.AT):
+                self.advance()
+                range_def = self.parse_number_range()
+            return StringType(line, col, range_def)
+        elif self.match(TokenType.BYTE, TokenType.SHORT, TokenType.INT, TokenType.LONG, 
+                        TokenType.FLOAT_TYPE, TokenType.DOUBLE):
+            type_name = self.current_token.value
+            self.advance()
+            # Optional range constraint
+            range_def = None
+            if self.match(TokenType.AT):
+                self.advance()
+                range_def = self.parse_number_range()
+            return NumericType(line, col, type_name, range_def)
+        elif self.match(TokenType.INTEGER, TokenType.FLOAT):
+            value = self.current_token.value
+            self.advance()
+            return LiteralType(line, col, value)
+        elif self.match(TokenType.STRING):
+            value = self.current_token.value
+            self.advance()
+            return LiteralType(line, col, value)
+        elif self.match(TokenType.BOOLEAN):
+            value = self.current_token.value == 'true'
+            self.advance()
+            return LiteralType(line, col, value)
+        elif self.match(TokenType.LBRACKET):
+            return self.parse_list_type()
+        elif self.match(TokenType.LPAREN):
+            return self.parse_parenthesized_type()
+        elif self.match(TokenType.LBRACE):
+            return self.parse_struct()
+        elif self.match(TokenType.IDENTIFIER):
+            return self.parse_reference_type()
+        else:
+            self.error(f"Unexpected token in type: {self.current_token.type}")
+    
+    def parse_list_type(self) -> Type:
+        line, col = self.current_token.line, self.current_token.column
+        self.consume(TokenType.LBRACKET)
+        
+        element_type = self.parse_type()
+        self.consume(TokenType.RBRACKET)
+        
+        # Check for size constraint
+        size_range = None
+        if self.match(TokenType.AT):
+            self.advance()
+            size_range = self.parse_number_range()
+        
+        return ListType(line, col, element_type, size_range)
+    
+    def parse_parenthesized_type(self) -> Type:
+        self.consume(TokenType.LPAREN)
+        
+        if self.match(TokenType.RPAREN):
+            # Empty tuple
+            self.advance()
+            return TupleType(self.current_token.line, self.current_token.column, [])
+        
+        first_type = self.parse_type()
+        
+        if self.match(TokenType.COMMA):
+            # Tuple type
+            types = [first_type]
+            while self.match(TokenType.COMMA):
+                self.advance()
+                if not self.match(TokenType.RPAREN):
+                    types.append(self.parse_type())
+            self.consume(TokenType.RPAREN)
+            return TupleType(first_type.line, first_type.column, types)
+        else:
+            # Parenthesized type
+            self.consume(TokenType.RPAREN)
+            return first_type
+    
+    def parse_reference_type(self) -> Type:
+        line, col = self.current_token.line, self.current_token.column
+        path = self.parse_path()
+        
+        # Type arguments
+        type_args = []
+        if self.match(TokenType.LANGLE):
+            self.advance()
+            while not self.match(TokenType.RANGLE):
+                type_args.append(self.parse_type())
+                
+                if self.match(TokenType.COMMA):
+                    self.advance()
+                elif not self.match(TokenType.RANGLE):
+                    self.error("Expected ',' or '>' in type arguments")
+            
+            self.consume(TokenType.RANGLE)
+        
+        ref_type = ReferenceType(line, col, path, type_args)
+        
+        # Check for indexing
+        if self.match(TokenType.LBRACKET):
+            return self.parse_indexed_type(ref_type)
+        
+        return ref_type
+    
+    def parse_indexed_type(self, base_type: Type) -> Type:
+        indices = []
+        
+        while self.match(TokenType.LBRACKET):
+            self.advance()
+            
+            if self.match(TokenType.IDENTIFIER):
+                indices.append(self.current_token.value)
+                self.advance()
+            elif self.match(TokenType.FALLBACK, TokenType.NONE, TokenType.UNKNOWN, TokenType.KEY, TokenType.PARENT):
+                indices.append(self.current_token.value)
+                self.advance()
+            else:
+                self.error("Expected index")
+            
+            self.consume(TokenType.RBRACKET)
+        
+        return IndexedType(base_type.line, base_type.column, base_type, indices)
