@@ -870,3 +870,266 @@ class Parser:
             self.consume(TokenType.RBRACKET)
         
         return IndexedType(base_type.line, base_type.column, base_type, indices)
+
+    def parse_number_range(self) -> NumberRange:
+        """Parse number range like 1..10, <5, 3..<7, etc."""
+        min_val = None
+        max_val = None
+        min_exclusive = False
+        max_exclusive = False
+        
+        # Handle single values or range start
+        if self.match(TokenType.INTEGER, TokenType.FLOAT):
+            min_val = float(self.current_token.value)
+            self.advance()
+            
+            # Check for range operators
+            if self.match(TokenType.RANGE):
+                self.advance()
+                if self.match(TokenType.INTEGER, TokenType.FLOAT):
+                    max_val = float(self.current_token.value)
+                    self.advance()
+            elif self.match(TokenType.RANGE_EXCLUSIVE):
+                max_exclusive = True
+                self.advance()
+                if self.match(TokenType.INTEGER, TokenType.FLOAT):
+                    max_val = float(self.current_token.value)
+                    self.advance()
+        elif self.match(TokenType.EXCLUSIVE_RANGE):
+            min_exclusive = True
+            self.advance()
+            if self.match(TokenType.INTEGER, TokenType.FLOAT):
+                max_val = float(self.current_token.value)
+                self.advance()
+        elif self.match(TokenType.EXCLUSIVE_RANGE_EXCLUSIVE):
+            min_exclusive = True
+            max_exclusive = True
+            self.advance()
+            if self.match(TokenType.INTEGER, TokenType.FLOAT):
+                max_val = float(self.current_token.value)
+                self.advance()
+        
+        return NumberRange(min_val, max_val, min_exclusive, max_exclusive)
+    
+    def parse_path(self) -> str:
+        """Parse dot-separated path like foo.bar.baz"""
+        parts = [self.consume(TokenType.IDENTIFIER).value]
+        
+        while self.match(TokenType.DOUBLE_COLON):
+            self.advance()
+            parts.append(self.consume(TokenType.IDENTIFIER).value)
+        
+        return "::".join(parts)
+
+
+class JSONSchemaGenerator:
+    """Converts mcdoc AST to JSON Schema"""
+    
+    def __init__(self):
+        self.schema_cache = {}
+        self.type_definitions = {}
+    
+    def generate_schema(self, module: Module) -> Dict[str, Any]:
+        """Generate JSON Schema from mcdoc module"""
+        schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "definitions": {}
+        }
+        
+        # Process all type definitions first
+        for stmt in module.statements:
+            if isinstance(stmt, TypeAlias):
+                self.type_definitions[stmt.name] = stmt
+                schema["definitions"][stmt.name] = self.convert_type(stmt.target_type)
+            elif isinstance(stmt, StructType):
+                # Anonymous struct - add to definitions with generated name
+                struct_name = f"Struct_{id(stmt)}"
+                schema["definitions"][struct_name] = self.convert_type(stmt)
+            elif isinstance(stmt, EnumType):
+                # Anonymous enum - add to definitions with generated name
+                enum_name = f"Enum_{id(stmt)}"
+                schema["definitions"][enum_name] = self.convert_type(stmt)
+        
+        return schema
+    
+    def convert_type(self, type_node: Type) -> Dict[str, Any]:
+        """Convert mcdoc type to JSON Schema"""
+        if isinstance(type_node, AnyType):
+            return {}
+        
+        elif isinstance(type_node, BooleanType):
+            return {"type": "boolean"}
+        
+        elif isinstance(type_node, StringType):
+            schema = {"type": "string"}
+            if type_node.range:
+                if type_node.range.min_value is not None:
+                    schema["minLength"] = int(type_node.range.min_value)
+                if type_node.range.max_value is not None:
+                    schema["maxLength"] = int(type_node.range.max_value)
+            return schema
+        
+        elif isinstance(type_node, NumericType):
+            if type_node.type_name in ["float", "double"]:
+                schema = {"type": "number"}
+            else:
+                schema = {"type": "integer"}
+            
+            if type_node.range:
+                if type_node.range.min_value is not None:
+                    key = "exclusiveMinimum" if type_node.range.min_exclusive else "minimum"
+                    schema[key] = type_node.range.min_value
+                if type_node.range.max_value is not None:
+                    key = "exclusiveMaximum" if type_node.range.max_exclusive else "maximum"
+                    schema[key] = type_node.range.max_value
+            
+            return schema
+        
+        elif isinstance(type_node, LiteralType):
+            return {"const": type_node.value}
+        
+        elif isinstance(type_node, ListType):
+            schema = {
+                "type": "array",
+                "items": self.convert_type(type_node.element_type)
+            }
+            if type_node.size_range:
+                if type_node.size_range.min_value is not None:
+                    schema["minItems"] = int(type_node.size_range.min_value)
+                if type_node.size_range.max_value is not None:
+                    schema["maxItems"] = int(type_node.size_range.max_value)
+            return schema
+        
+        elif isinstance(type_node, TupleType):
+            return {
+                "type": "array",
+                "prefixItems": [self.convert_type(t) for t in type_node.element_types],
+                "items": False
+            }
+        
+        elif isinstance(type_node, UnionType):
+            return {"anyOf": [self.convert_type(t) for t in type_node.types]}
+        
+        elif isinstance(type_node, StructType):
+            schema = {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False
+            }
+            
+            required = []
+            for field in type_node.fields:
+                schema["properties"][field.name] = self.convert_type(field.type)
+                if not field.optional:
+                    required.append(field.name)
+            
+            if required:
+                schema["required"] = required
+            
+            # Handle spreads
+            if type_node.spreads:
+                all_of = [{"type": "object", "properties": schema["properties"]}]
+                if required:
+                    all_of[0]["required"] = required
+                
+                for spread in type_node.spreads:
+                    all_of.append(self.convert_type(spread))
+                
+                return {"allOf": all_of}
+            
+            return schema
+        
+        elif isinstance(type_node, EnumType):
+            if all(v.value is not None for v in type_node.variants):
+                # Integer enum
+                return {"enum": [v.value for v in type_node.variants]}
+            else:
+                # String enum
+                return {"enum": [v.name for v in type_node.variants]}
+        
+        elif isinstance(type_node, ReferenceType):
+            return {"$ref": f"#/definitions/{type_node.path}"}
+        
+        elif isinstance(type_node, IndexedType):
+            # For indexed types, we'll create a more complex schema
+            base_schema = self.convert_type(type_node.base_type)
+            # This is simplified - real implementation would need dispatch logic
+            return base_schema
+        
+        else:
+            return {}
+
+
+class McdocCompiler:
+    """Main compiler class"""
+    
+    def __init__(self):
+        self.modules = {}
+        self.schema_generator = JSONSchemaGenerator()
+    
+    def compile_file(self, file_path: Path) -> Dict[str, Any]:
+        """Compile a single mcdoc file"""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            lexer = Lexer(content)
+            tokens = lexer.tokenize()
+            
+            parser = Parser(tokens)
+            module = parser.parse_module()
+            
+            return self.schema_generator.generate_schema(module)
+            
+        except (LexerError, ParseError) as e:
+            print(f"Error compiling {file_path}: {e}")
+            return {}
+        except Exception as e:
+            print(f"Unexpected error compiling {file_path}: {e}")
+            return {}
+    
+    def compile_directory(self, input_dir: Path, output_dir: Path):
+        """Compile all mcdoc files in a directory"""
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        for mcdoc_file in input_dir.rglob("*.mcdoc"):
+            print(f"Compiling {mcdoc_file}")
+            
+            schema = self.compile_file(mcdoc_file)
+            
+            # Create output path
+            relative_path = mcdoc_file.relative_to(input_dir)
+            output_file = output_dir / relative_path.with_suffix('.json')
+            
+            # Ensure output directory exists
+            output_file.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Write JSON schema
+            with open(output_file, 'w', encoding='utf-8') as f:
+                json.dump(schema, f, indent=2)
+            
+            print(f"Generated {output_file}")
+
+
+def main():
+    """Main entry point"""
+    if len(sys.argv) != 3:
+        print("Usage: python mcdoc_compiler.py <input_folder> <output_folder>")
+        sys.exit(1)
+    
+    input_folder = Path(sys.argv[1])
+    output_folder = Path(sys.argv[2])
+    
+    if not input_folder.exists():
+        print(f"Input folder {input_folder} does not exist")
+        sys.exit(1)
+    
+    compiler = McdocCompiler()
+    compiler.compile_directory(input_folder, output_folder)
+    
+    print("Compilation complete!")
+
+
+if __name__ == "__main__":
+    main()
